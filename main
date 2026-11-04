@@ -1,0 +1,360 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <DHT.h>
+#include <math.h>
+
+#include "config.h"
+
+U8G2_SH1107_128X128_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+DHT dht(PIN_DHT_DATA, DHT22);
+
+enum ControlMode : uint8_t { MODE_AUTO = 0, MODE_MANUAL = 1 };
+
+ControlMode controlMode = MODE_AUTO;
+bool relayState = false;
+bool manualRelayState = false;
+
+float temperatureC = NAN;
+float humidityPct = NAN;
+bool hasTemp = false;
+bool hasHum = false;
+
+int soilRaw = 0;
+int soilPct = 0;
+int ldrRaw = 0;
+int ldrPct = 0;
+
+int soilOnPct  = DEFAULT_SOIL_ON_PCT;
+int soilOffPct = DEFAULT_SOIL_OFF_PCT;
+float tempOnC  = DEFAULT_TEMP_ON_C;
+float tempOffC = DEFAULT_TEMP_OFF_C;
+
+String telemetryEndpoint = DEFAULT_TELEMETRY_ENDPOINT;
+String serialLine;
+
+uint32_t lastSensorMs = 0;
+uint32_t lastDhtMs = 0;
+uint32_t lastDisplayMs = 0;
+uint32_t lastTelemetryMs = 0;
+uint32_t lastWiFiRetryMs = 0;
+wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
+
+static int toPercentLinear(int raw, int minRaw, int maxRaw) {
+  float pct = ((float)(raw - minRaw) * 100.0f) / (float)(maxRaw - minRaw);
+  return constrain((int)roundf(pct), 0, 100);
+}
+
+static void setRelay(bool on) {
+  relayState = on;
+  digitalWrite(PIN_RELAY_IN, relayState ? HIGH : LOW);
+}
+
+static void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[WiFi] Connecting to SSID: %s\n", WIFI_SSID);
+}
+
+static void maintainWiFi() {
+  wl_status_t s = WiFi.status();
+  if (s != lastWiFiStatus) {
+    lastWiFiStatus = s;
+    if (s == WL_CONNECTED) {
+      Serial.printf("[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.printf("[WiFi] Status changed: %d\n", (int)s);
+    }
+  }
+
+  if (s != WL_CONNECTED && millis() - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+    lastWiFiRetryMs = millis();
+    Serial.println("[WiFi] Reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+}
+
+static void readDhtIfDue() {
+  if (millis() - lastDhtMs < DHT_INTERVAL_MS) return;
+  lastDhtMs = millis();
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h)) {
+    humidityPct = h;
+    hasHum = true;
+  }
+  if (!isnan(t)) {
+    temperatureC = t;
+    hasTemp = true;
+  }
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println("[DHT22] Read failed, keeping last good values.");
+  }
+}
+
+static void readAnalogIfDue() {
+  if (millis() - lastSensorMs < SENSOR_INTERVAL_MS) return;
+  lastSensorMs = millis();
+
+  soilRaw = analogRead(PIN_SOIL_AOUT);
+  ldrRaw = analogRead(PIN_LDR_AIN);
+
+  // Capacitive soil sensor: inverted response (dry high, wet low)
+  soilPct = toPercentLinear(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC);
+
+  // LDR divider: brighter -> higher ADC (per provided divider orientation)
+  ldrPct = toPercentLinear(ldrRaw, 0, 4095);
+}
+
+static void autoControlRelay() {
+  if (controlMode == MODE_MANUAL) {
+    setRelay(manualRelayState);
+    return;
+  }
+
+  bool tempHigh = hasTemp && (temperatureC >= tempOnC);
+  bool tempLow = hasTemp && (temperatureC <= tempOffC);
+
+  if (!relayState) {
+    if (soilPct <= soilOnPct || tempHigh) {
+      setRelay(true);
+    }
+  } else {
+    if (soilPct >= soilOffPct && tempLow) {
+      setRelay(false);
+    }
+  }
+}
+
+static void drawDisplay() {
+  if (millis() - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
+  lastDisplayMs = millis();
+
+  char line[64];
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(0, 10, "Smart Greenhouse");
+
+    if (hasTemp) {
+      snprintf(line, sizeof(line), "Temp: %.1f C", temperatureC);
+    } else {
+      snprintf(line, sizeof(line), "Temp: --");
+    }
+    u8g2.drawStr(0, 24, line);
+
+    if (hasHum) {
+      snprintf(line, sizeof(line), "Hum : %.1f %%", humidityPct);
+    } else {
+      snprintf(line, sizeof(line), "Hum : --");
+    }
+    u8g2.drawStr(0, 36, line);
+
+    snprintf(line, sizeof(line), "Soil: %d%% (%d)", soilPct, soilRaw);
+    u8g2.drawStr(0, 50, line);
+
+    snprintf(line, sizeof(line), "Light:%d%% (%d)", ldrPct, ldrRaw);
+    u8g2.drawStr(0, 62, line);
+
+    snprintf(line, sizeof(line), "Relay: %s", relayState ? "ON" : "OFF");
+    u8g2.drawStr(0, 78, line);
+
+    snprintf(line, sizeof(line), "Mode : %s", controlMode == MODE_AUTO ? "AUTO" : "MANUAL");
+    u8g2.drawStr(0, 90, line);
+
+    snprintf(line, sizeof(line), "WiFi : %s", WiFi.status() == WL_CONNECTED ? "OK" : "DOWN");
+    u8g2.drawStr(0, 102, line);
+
+    u8g2.drawStr(0, 118, "Cmd: HELP");
+  } while (u8g2.nextPage());
+}
+
+static String buildTelemetryJson() {
+  String json = "{";
+  json += "\"temperature_c\":";
+  json += hasTemp ? String(temperatureC, 2) : "null";
+  json += ",\"humidity_pct\":";
+  json += hasHum ? String(humidityPct, 2) : "null";
+  json += ",\"soil_raw\":";
+  json += String(soilRaw);
+  json += ",\"soil_pct\":";
+  json += String(soilPct);
+  json += ",\"light_raw\":";
+  json += String(ldrRaw);
+  json += ",\"light_pct\":";
+  json += String(ldrPct);
+  json += ",\"relay_on\":";
+  json += relayState ? "true" : "false";
+  json += ",\"mode\"😕"";
+  json += controlMode == MODE_AUTO ? "auto" : "manual";
+  json += "\"}";
+  return json;
+}
+
+static void sendTelemetryIfDue() {
+  if (millis() - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+  lastTelemetryMs = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] Skip telemetry: WiFi not connected.");
+    return;
+  }
+
+  String payload = buildTelemetryJson();
+  Serial.printf("[HTTP] POST %s\n", telemetryEndpoint.c_str());
+  Serial.printf("[HTTP] Payload: %s\n", payload.c_str());
+
+  HTTPClient http;
+  int httpCode = -1;
+  String response;
+
+  if (telemetryEndpoint.startsWith("https://")) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    if (http.begin(client, telemetryEndpoint)) {
+      http.addHeader("Content-Type", "application/json");
+      httpCode = http.POST((uint8_t*)payload.c_str(), payload.length());
+      response = http.getString();
+      http.end();
+    }
+  } else {
+    if (http.begin(telemetryEndpoint)) {
+      http.addHeader("Content-Type", "application/json");
+      httpCode = http.POST((uint8_t*)payload.c_str(), payload.length());
+      response = http.getString();
+      http.end();
+    }
+  }
+
+  Serial.printf("[HTTP] Code: %d\n", httpCode);
+  if (response.length() > 0) {
+    Serial.printf("[HTTP] Response: %s\n", response.c_str());
+  }
+}
+
+static void printStatus() {
+  Serial.println("----- STATUS -----");
+  Serial.printf("Mode: %s\n", controlMode == MODE_AUTO ? "AUTO" : "MANUAL");
+  Serial.printf("Relay: %s\n", relayState ? "ON" : "OFF");
+  Serial.printf("Temp: %s\n", hasTemp ? String(temperatureC, 1).c_str() : "--");
+  Serial.printf("Hum : %s\n", hasHum ? String(humidityPct, 1).c_str() : "--");
+  Serial.printf("Soil: %d%% (%d)\n", soilPct, soilRaw);
+  Serial.printf("LDR : %d%% (%d)\n", ldrPct, ldrRaw);
+  Serial.printf("Endpoint: %s\n", telemetryEndpoint.c_str());
+  Serial.printf("WiFi status: %d\n", (int)WiFi.status());
+  Serial.println("------------------");
+}
+
+static void printHelp() {
+  Serial.println("Commands:");
+  Serial.println("  HELP");
+  Serial.println("  STATUS");
+  Serial.println("  AUTO");
+  Serial.println("  MANUAL ON");
+  Serial.println("  MANUAL OFF");
+  Serial.println("  SET ENDPOINT <url>");
+  Serial.println("  SET SOIL_ON <0-100>");
+  Serial.println("  SET SOIL_OFF <0-100>");
+  Serial.println("  SET TEMP_ON <C>");
+  Serial.println("  SET TEMP_OFF <C>");
+}
+
+static void processCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  String upper = cmd;
+  upper.toUpperCase();
+
+  if (upper == "HELP") {
+    printHelp();
+  } else if (upper == "STATUS") {
+    printStatus();
+  } else if (upper == "AUTO") {
+    controlMode = MODE_AUTO;
+    Serial.println("[CMD] Mode set to AUTO");
+  } else if (upper == "MANUAL ON") {
+    controlMode = MODE_MANUAL;
+    manualRelayState = true;
+    setRelay(true);
+    Serial.println("[CMD] MANUAL relay ON");
+  } else if (upper == "MANUAL OFF") {
+    controlMode = MODE_MANUAL;
+    manualRelayState = false;
+    setRelay(false);
+    Serial.println("[CMD] MANUAL relay OFF");
+  } else if (upper.startsWith("SET ENDPOINT ")) {
+    telemetryEndpoint = cmd.substring(String("SET ENDPOINT ").length());
+    telemetryEndpoint.trim();
+    Serial.printf("[CMD] Endpoint set to: %s\n", telemetryEndpoint.c_str());
+  } else if (upper.startsWith("SET SOIL_ON ")) {
+    int v = cmd.substring(String("SET SOIL_ON ").length()).toInt();
+    soilOnPct = constrain(v, 0, 100);
+    Serial.printf("[CMD] SOIL_ON=%d\n", soilOnPct);
+  } else if (upper.startsWith("SET SOIL_OFF ")) {
+    int v = cmd.substring(String("SET SOIL_OFF ").length()).toInt();
+    soilOffPct = constrain(v, 0, 100);
+    Serial.printf("[CMD] SOIL_OFF=%d\n", soilOffPct);
+  } else if (upper.startsWith("SET TEMP_ON ")) {
+    tempOnC = cmd.substring(String("SET TEMP_ON ").length()).toFloat();
+    Serial.printf("[CMD] TEMP_ON=%.2f\n", tempOnC);
+  } else if (upper.startsWith("SET TEMP_OFF ")) {
+    tempOffC = cmd.substring(String("SET TEMP_OFF ").length()).toFloat();
+    Serial.printf("[CMD] TEMP_OFF=%.2f\n", tempOffC);
+  } else {
+    Serial.printf("[CMD] Unknown: %s\n", cmd.c_str());
+  }
+}
+
+static void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialLine.length() > 0) {
+        processCommand(serialLine);
+        serialLine = "";
+      }
+    } else if (isPrintable(c)) {
+      serialLine += c;
+      if (serialLine.length() > 200) serialLine.remove(0, 50);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(PIN_RELAY_IN, OUTPUT);
+  setRelay(false);
+
+  analogReadResolution(12);
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  u8g2.setI2CAddress(0x3C * 2); // U8g2 uses 8-bit address
+  u8g2.begin();
+
+  dht.begin();
+  connectWiFi();
+
+  Serial.println("Smart greenhouse monitor started.");
+  Serial.println("Note: Soil/LDR are on ADC2 pins (IO26/IO25); with WiFi active, ESP32 ADC2 may be unreliable.");
+  printHelp();
+}
+
+void loop() {
+  handleSerial();
+  maintainWiFi();
+  readDhtIfDue();
+  readAnalogIfDue();
+  autoControlRelay();
+  drawDisplay();
+  sendTelemetryIfDue();
+}
